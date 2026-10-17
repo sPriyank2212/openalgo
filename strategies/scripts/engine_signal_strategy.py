@@ -22,6 +22,9 @@ Run inside OpenAlgo's /python strategy host (it injects OPENALGO_API_KEY and
 inherits HOST_SERVER / WEBSOCKET_URL from .env), or standalone with those
 variables set. Flip the OpenAlgo UI to Analyzer Mode for Phase-1 sandbox
 forward validation (Sec 12).
+
+Offline tests: engine_signal_strategy_test.py (mocks the OpenAlgo SDK and
+exercises gate, bracket and brake logic without a broker).
 """
 
 import csv
@@ -229,11 +232,11 @@ class SignalLogger:
 
 
 # ----------------------------------------------------------------------------
-# Market data: ticks/quotes -> 5-min candles -> features (Spec components 2-3)
+# Market data: quotes -> 5-min candles -> features (Spec components 2-3)
 # ----------------------------------------------------------------------------
 
 class IndexFeed:
-    """Builds 5-min candles for one index from 1-min history + live quote."""
+    """Builds 5-min candles for one index from today's 1-min history."""
 
     def __init__(self, name, cfg):
         self.name = name
@@ -265,7 +268,7 @@ class IndexFeed:
 
         closes5 = []
         bucket = None
-        o = h = l = c = None
+        c = None
         day_o = day_h = day_l = None
         for ts, row in df.iterrows():
             try:
@@ -300,21 +303,34 @@ class IndexFeed:
             return True
         return (now_ist() - self.last_refresh).total_seconds() > STALE_SEC
 
+    def _completed(self):
+        """5-min candles that have fully closed. The bucket containing the
+        current minute is still forming and is excluded (Spec Sec 4 computes
+        features on 5-min candle closes; the manual checklist measures the
+        LAST CLOSED candle)."""
+        if not self.closes5:
+            return []
+        cur = now_ist().hour * 60 + now_ist().minute
+        if self.closes5[-1][0] >= cur // 5:
+            return self.closes5[:-1]
+        return self.closes5
+
     # -- features (Spec Sec 4) ----------------------------------------------
 
     def features(self):
-        """(m5, m30, rng, trend) from completed context + latest close.
+        """(m5, m30, rng, trend) from completed 5-min candles.
 
-        m5/m30/trend use the last close vs closes 1 / 6 / 12 five-minute
-        bars back. rng uses the running day high/low.
+        m5/m30/trend use the last completed close vs closes 1 / 6 / 12
+        candles back. rng uses the running day high/low.
         """
-        n = len(self.closes5)
+        done = self._completed()
+        n = len(done)
         if n < 2:
             return None
-        close = self.closes5[-1][1]
-        m5 = close - self.closes5[-2][1]
-        m30 = close - self.closes5[-7][1] if n >= 7 else None
-        m60 = close - self.closes5[-13][1] if n >= 13 else None
+        close = done[-1][1]
+        m5 = close - done[-2][1]
+        m30 = close - done[-7][1] if n >= 7 else None
+        m60 = close - done[-13][1] if n >= 13 else None
         if self.day_high is None or self.day_low is None or self.day_high == self.day_low:
             rng = 0.5
         else:
@@ -326,25 +342,27 @@ class IndexFeed:
         return {"close": close, "m5": m5, "m30": m30, "rng": rng, "trend": trend}
 
     def new_candle_closed(self):
-        """True once per newly completed 5-min bucket."""
-        if len(self.closes5) < 2:
+        """True once per newly completed 5-min candle."""
+        done = self._completed()
+        if len(done) < 2:
             return False
-        key = self.closes5[-2][0]  # last *completed* bucket
+        key = done[-1][0]
         if key != self.last_candle_key:
             self.last_candle_key = key
             return True
         return False
 
-    # -- provisional flip detection (Spec Sec 13) ----------------------------
+    # -- provisional flip detection (Spec Sec 13) ---------------------------
 
     def update_flip(self, feats):
+        """Flip = >=30/90-pt 5-min burst whose candle CLOSES across the day
+        open; reverses bias for FLIP_LIFE_MIN minutes (Sec 13, provisional)."""
         if not FLIP_ENABLED or feats is None or self.day_open is None:
             return
-        n = len(self.closes5)
-        if n < 2:
+        done = self._completed()
+        if len(done) < 2:
             return
-        prev = self.closes5[-2][1]
-        cur = feats["close"]
+        prev, cur = done[-2][1], done[-1][1]
         burst = feats["m5"]
         crossed = (prev - self.day_open) * (cur - self.day_open) < 0
         if crossed and abs(burst) >= self.cfg["flip"]:
@@ -428,8 +446,14 @@ def run_gate(name, side, feed, gov, premium_ok):
     sm5 = feats["m5"] * sgn
     sm30 = (feats["m30"] or 0.0) * sgn
 
+    # C3 (Spec Sec 3): veto when the signal FIGHTS the live trend and no flip
+    # is active. When the session is too young to read a trend (trend == 0,
+    # first ~30 min), the signal is not fighting anything: the check passes.
     flip = feed.flip_active()
-    c3 = (feats["trend"] == sgn and feats["trend"] != 0) or (flip == sgn and flip != 0)
+    if feats["trend"] == 0:
+        c3 = True
+    else:
+        c3 = feats["trend"] == sgn or flip == sgn
 
     checks = {
         "C1": sm5 >= cfg["trigger"],
@@ -517,6 +541,8 @@ def wait_fill(order_id, timeout=ORDER_TIMEOUT_SEC):
                 return st, 0.0, 0
         except Exception as e:
             print(f"orderstatus error: {e}")
+        if timeout <= 1:
+            break
         time.sleep(2)
     return "timeout", 0.0, 0
 
@@ -769,7 +795,8 @@ def drain_inbox():
 # ----------------------------------------------------------------------------
 
 def attempt_signal(name, side, feeds, gov, logger, engine_sl=None, engine_t1=None):
-    """Full pipeline for one candidate signal (Spec Sec 4 + 11.5)."""
+    """Full pipeline for one candidate signal (Spec Sec 4 + 11.5).
+    Returns (trade, signal_ctx) when a bracket went live, else None."""
     if gov.done_for_day:
         return
     feed = feeds[name]
@@ -840,6 +867,8 @@ def attempt_signal(name, side, feeds, gov, logger, engine_sl=None, engine_t1=Non
     signal_ctx["slippage"] = round(fill_price - premium, 2) if premium else ""
     if trade.place_bracket():
         return trade, signal_ctx
+    # SL leg rejected at placement: position already market-exited; record it
+    trade._close(gov, logger, signal_ctx, "SL_REJECT", None)
     return None
 
 
