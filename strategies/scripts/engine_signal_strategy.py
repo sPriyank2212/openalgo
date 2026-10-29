@@ -809,8 +809,8 @@ def dedupe(name, side):
 
 def drain_inbox():
     """Gate mode: engine alerts as a JSON list in the inbox file. Each alert:
-    {\"index\": \"NIFTY\"|\"SENSEX\", \"side\": \"CE\"|\"PE\",
-     \"engine_sl\": <premium, optional>, \"engine_t1\": <premium, optional>}
+    {"index": "NIFTY"|"SENSEX", "side": "CE"|"PE",
+     "engine_sl": <premium, optional>, "engine_t1": <premium, optional>}
     Consumed alerts are removed."""
     if not os.path.exists(INBOX_PATH):
         return []
