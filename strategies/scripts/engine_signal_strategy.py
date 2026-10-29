@@ -18,6 +18,16 @@ OpenAlgo Automation Specification" (v1.0, Oct 2025):
 Every threshold is an environment variable (prefix ESS_) so nothing is buried
 in code (Sec 11.7). Defaults below are the spec defaults.
 
+v1.1 (Oct 2026) -- expiry-aware C8 premium band
+  Live-feed analysis of 29-Oct-2026 (a SENSEX weekly expiry day) showed the
+  fixed C8 band misfiring on expiry day: SENSEX ATM premiums ran Rs 43-364
+  intraday, so the fixed Rs 300-460 band vetoed winners worth +Rs 3,570 while
+  catching only one -Rs 880 loser. On expiry day theta crushes ATM premiums,
+  so "cheap" is normal. C8 now scales its LOWER band bound by
+  ESS_BAND_EXPIRY_SCALE (default 0.15) on the index's weekly expiry day
+  (NIFTY = Tuesday, SENSEX = Thursday, both env-overridable); the upper bound
+  is unchanged. Non-expiry days are untouched.
+
 Run inside OpenAlgo's /python strategy host (it injects OPENALGO_API_KEY and
 inherits HOST_SERVER / WEBSOCKET_URL from .env), or standalone with those
 variables set. Flip the OpenAlgo UI to Analyzer Mode for Phase-1 sandbox
@@ -77,6 +87,8 @@ STRATEGY_NAME = _env("ESS_STRATEGY_NAME", "Engine Signal Strategy")
 MODE = _env("ESS_MODE", "both").strip().lower()
 
 # Per-index parameters. Threshold order per spec: NIFTY first / SENSEX second.
+# expiry_weekday: python weekday() convention (Mon=0 .. Sun=6); the weekly
+# expiry day of that index's options (Oct 2026: NIFTY Tue=1, SENSEX Thu=3).
 INDICES = {
     "NIFTY": {
         "quote_symbol": _env("ESS_NIFTY_SYMBOL", "NIFTY"),
@@ -88,6 +100,7 @@ INDICES = {
         "premium_band": (_env_float("ESS_BAND_LO_NIFTY", 120),
                          _env_float("ESS_BAND_HI_NIFTY", 215)),   # C8, INR
         "lot_default": _env_int("ESS_LOT_NIFTY", 65),
+        "expiry_weekday": _env_int("ESS_EXPIRY_WEEKDAY_NIFTY", 1),   # Tuesday
     },
     "SENSEX": {
         "quote_symbol": _env("ESS_SENSEX_SYMBOL", "SENSEX"),
@@ -99,6 +112,7 @@ INDICES = {
         "premium_band": (_env_float("ESS_BAND_LO_SENSEX", 300),
                          _env_float("ESS_BAND_HI_SENSEX", 460)),
         "lot_default": _env_int("ESS_LOT_SENSEX", 20),
+        "expiry_weekday": _env_int("ESS_EXPIRY_WEEKDAY_SENSEX", 3),  # Thursday
     },
 }
 
@@ -128,6 +142,11 @@ T1_FRACTION = _env_float("ESS_T1_FRACTION", 0.5)         # booked at T1 when qty
 # Flip rule: provisional (Sec 13) -- disabled by default
 FLIP_ENABLED = _env_bool("ESS_FLIP_ENABLED", False)
 FLIP_LIFE_MIN = _env_int("ESS_FLIP_LIFE_MIN", 30)
+
+# Expiry-day C8 (v1.1): on the index's weekly expiry day, the premium band's
+# LOWER bound is multiplied by this scale (theta-crushed cheap premiums are
+# normal on expiry day). The upper bound is not scaled. 1.0 disables.
+BAND_EXPIRY_SCALE = _env_float("ESS_BAND_EXPIRY_SCALE", 0.15)
 
 # Contract selection (Sec 6)
 STEP_ITM_IF_BELOW_BAND = _env_bool("ESS_STEP_ITM", True)  # ATM -> ITM1, never OTM
@@ -436,6 +455,21 @@ def in_kill_zone():
     return KILL_START_M <= m < KILL_END_M
 
 
+def is_expiry_day(name, when=None):
+    """True when `when` (default now) is the index's weekly expiry weekday."""
+    when = when or now_ist()
+    return when.weekday() == INDICES[name]["expiry_weekday"]
+
+
+def premium_band(name, when=None):
+    """Effective C8 premium band. On the index's expiry day the LOWER bound
+    is scaled by BAND_EXPIRY_SCALE (v1.1); the upper bound is unchanged."""
+    lo, hi = INDICES[name]["premium_band"]
+    if is_expiry_day(name, when):
+        return (round(lo * BAND_EXPIRY_SCALE, 2), hi)
+    return (lo, hi)
+
+
 def run_gate(name, side, feed, gov, premium_ok):
     """Returns (checks dict C1..C8 -> bool, failed list, feature snapshot)."""
     cfg = feed.cfg
@@ -503,8 +537,9 @@ def option_ltp(symbol, exchange):
 
 def select_contract(name, side):
     """ATM strike; one step ITM when ATM premium is below the band (never OTM).
-    Returns (contract dict, premium, premium_ok)."""
-    band_lo, band_hi = INDICES[name]["premium_band"]
+    Returns (contract dict, premium, premium_ok). The band is expiry-day
+    aware (v1.1): lower bound scaled down on the weekly expiry day."""
+    band_lo, band_hi = premium_band(name)
     for offset in (["ATM", "ITM1"] if STEP_ITM_IF_BELOW_BAND else ["ATM"]):
         c = resolve_option(name, side, offset)
         if not c:
@@ -774,8 +809,8 @@ def dedupe(name, side):
 
 def drain_inbox():
     """Gate mode: engine alerts as a JSON list in the inbox file. Each alert:
-    {"index": "NIFTY"|"SENSEX", "side": "CE"|"PE",
-     "engine_sl": <premium, optional>, "engine_t1": <premium, optional>}
+    {\"index\": \"NIFTY\"|\"SENSEX\", \"side\": \"CE\"|\"PE\",
+     \"engine_sl\": <premium, optional>, \"engine_t1\": <premium, optional>}
     Consumed alerts are removed."""
     if not os.path.exists(INBOX_PATH):
         return []
@@ -877,6 +912,9 @@ def main():
     print(f"kill zone {KILL_START}-{KILL_END} IST | day brake {DAY_BRAKE} | "
           f"max trades {MAX_TRADES} | EOD {EOD_FLATTEN}")
     print(f"flip rule {'ENABLED' if FLIP_ENABLED else 'disabled (provisional)'}")
+    print(f"expiry-aware C8: lower band x{BAND_EXPIRY_SCALE} on expiry day "
+          f"(NIFTY weekday {INDICES['NIFTY']['expiry_weekday']}, "
+          f"SENSEX weekday {INDICES['SENSEX']['expiry_weekday']})")
     notify(f"{STRATEGY_NAME} armed ({MODE} mode)")
 
     feeds = {name: IndexFeed(name, cfg) for name, cfg in INDICES.items()}
