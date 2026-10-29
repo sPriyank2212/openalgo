@@ -4,9 +4,10 @@ Offline test harness for engine_signal_strategy.py.
 
 Mocks the OpenAlgo SDK and the /api/v1/optionsymbol REST call, feeds
 synthetic 1-min candles into the real IndexFeed/gate/bracket code, and
-asserts the spec's behaviour (v1.0, Oct 2025): the eight checks veto
-individually, a full-pass signal produces the right orders, brackets exit
-correctly, and the brakes trip.
+asserts the spec's behaviour (v1.0, Oct 2025 + v1.1 expiry-aware C8, Oct
+2026): the eight checks veto individually, a full-pass signal produces the
+right orders, brackets exit correctly, the brakes trip, and the C8 premium
+band scales its lower bound on the index's weekly expiry day.
 
 No broker, no network, no real time needed. Run:
 
@@ -27,7 +28,7 @@ os.environ["ESS_TELEGRAM_USER"] = ""
 import pandas as pd  # noqa: E402
 
 IST = timezone(timedelta(hours=5, minutes=30))
-DAY = datetime(2025, 10, 16)  # a sample trading day from the research window
+DAY = datetime(2025, 10, 16)  # a Thursday: SENSEX weekly expiry day
 
 
 # --- fake OpenAlgo client ----------------------------------------------------
@@ -492,6 +493,34 @@ def t14_flip_rule():
     ess.FLIP_ENABLED = False
 
 
+def t15_c8_expiry_day_band():
+    print("T15: expiry-aware C8 band (v1.1) -- SENSEX Thursday expiry")
+    # Test clock sits on Thursday 2025-10-16 == SENSEX weekly expiry weekday.
+    set_time(10, 7)
+    n_lo, n_hi = ess.premium_band("NIFTY")
+    check("NIFTY band unchanged (its expiry is Tuesday)",
+          (n_lo, n_hi) == tuple(ess.INDICES["NIFTY"]["premium_band"]),
+          f"got {(n_lo, n_hi)}")
+    s_lo, s_hi = ess.premium_band("SENSEX")
+    check("SENSEX lower bound scaled on expiry day",
+          abs(s_lo - 300.0 * ess.BAND_EXPIRY_SCALE) < 1e-9 and s_hi == 460.0,
+          f"got {(s_lo, s_hi)}")
+    # Rs 200 premium: below the normal 300 lower bound, inside the expiry band
+    _fake.option_premiums = {"SENSEX_ATM_CE": 200.0, "SENSEX_ITM1_CE": 200.0}
+    c, prem, ok = ess.select_contract("SENSEX", "CE")
+    check("expiry-day Rs 200 premium passes C8",
+          ok is True and prem == 200.0 and c["symbol"] == "SENSEX_ATM_CE",
+          f"got {c} {prem} {ok}")
+    # Same premium on a Wednesday (non-expiry) must still veto C8
+    ess.now_ist = lambda: datetime(2025, 10, 15, 10, 7, tzinfo=IST)
+    s_lo2, _ = ess.premium_band("SENSEX")
+    check("mid-week band unscaled", s_lo2 == 300.0, f"got {s_lo2}")
+    c2, prem2, ok2 = ess.select_contract("SENSEX", "CE")
+    check("mid-week Rs 200 premium still vetoed", ok2 is False,
+          f"got {c2} {prem2} {ok2}")
+    set_time(10, 7)  # restore clock
+
+
 def main():
     os.makedirs("/tmp/ess_test_logs", exist_ok=True)
     t1_take_all_pass()
@@ -508,6 +537,7 @@ def main():
     t12_dedupe_and_stale()
     t13_scanner_new_candle()
     t14_flip_rule()
+    t15_c8_expiry_day_band()
     print()
     print(f"{len(PASSED)} passed, {len(FAILED)} failed")
     if FAILED:

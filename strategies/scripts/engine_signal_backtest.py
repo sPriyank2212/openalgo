@@ -8,17 +8,24 @@ signals independently (|m5| >= trigger bursts, direction = sign of burst).
 
 Two arms per burst signal:
   - RAW:      every burst taken (the "engine raw" equivalent)
-  - FILTERED: only bursts passing C1-C8 + brakes (the checklist arm)
+  - FILTERED: only bursts passing C1-C8 + brakes (the checklist arm, v1.1)
 
 Trade simulation (disclosed approximations - see README output):
   * ATM weekly option, entry premium E0 = mid-band (NIFTY 160 / SENSEX 380)
+  * On the index's weekly expiry day (NIFTY Tue, SENSEX Thu) E0 is scaled by
+    EXPIRY_PREMIUM_FACTOR (0.5) to mimic theta-crushed expiry-day premiums
   * Premium path approximated from the index path: P = E0 + DELTA * signed
     index move since entry (delta 0.55, no theta decay)
   * SL = -15% of premium, T1 = +8%, T2 = +25%; SL -> cost after T1 touch
   * Intrabar ambiguity resolved pessimistically: if a candle's range touches
     both SL and a target, SL is assumed hit first
   * Flat by the 15:15 IST candle; one open position at a time
-  * C8 (premium sanity) assumed pass - entry premium is synthetic by design
+  * C8 (premium sanity) evaluated for real against the synthetic E0:
+    v1.1 rule = on expiry day the LOWER band bound is scaled by
+    BAND_EXPIRY_SCALE (0.15), upper bound unchanged (mirrors
+    engine_signal_strategy.py premium_band()). The summary also reports the
+    P&L of trades that the OLD v1.0 fixed band would have vetoed but v1.1
+    takes -- the measured value of the fix.
   * Lot sizes: NIFTY 65, SENSEX 20 (verify against instrument master live)
 
 Usage: python3 engine_signal_backtest.py   (reads nsei_5m.csv / bsesn_5m.csv)
@@ -32,10 +39,12 @@ import pandas as pd
 
 IST = timezone(timedelta(hours=5, minutes=30))
 
-# --- parameters (spec defaults, Sec 11.7) -------------------------------------
+# --- parameters (spec defaults, Sec 11.7; v1.1 expiry-aware C8) ---------------
 PARAMS = {
-    "NIFTY": dict(trigger=20.0, exhaustion=40.0, lot=65, premium0=160.0),
-    "SENSEX": dict(trigger=60.0, exhaustion=130.0, lot=20, premium0=380.0),
+    "NIFTY": dict(trigger=20.0, exhaustion=40.0, lot=65, premium0=160.0,
+                  band=(120.0, 215.0), expiry_weekday=1),   # Tuesday
+    "SENSEX": dict(trigger=60.0, exhaustion=130.0, lot=20, premium0=380.0,
+                   band=(300.0, 460.0), expiry_weekday=3),  # Thursday
 }
 DELTA = 0.55
 RNG_MIN, RNG_MAX = 0.15, 0.85
@@ -46,6 +55,9 @@ DAY_BRAKE = -7000.0
 MAX_TRADES = 12
 COOLDOWN_MIN = 60
 SL_CHAIN_LIMIT = 2
+# v1.1: expiry-day C8 lower-bound scale + synthetic premium theta factor
+BAND_EXPIRY_SCALE = 0.15
+EXPIRY_PREMIUM_FACTOR = 0.5
 
 
 def load(path, name):
@@ -64,7 +76,20 @@ class DayState:
         self.day_open = float(self.df["open"].iloc[0])
 
 
-def gate(day, i, sgn, gov, minute):
+def effective_band(p, day_date):
+    """v1.1 C8 band: lower bound scaled on the index's expiry weekday."""
+    lo, hi = p["band"]
+    if day_date.weekday() == p["expiry_weekday"]:
+        return (round(lo * BAND_EXPIRY_SCALE, 2), hi, True)
+    return (lo, hi, False)
+
+
+def entry_premium(p, expiry):
+    """Synthetic entry premium; theta-crushed on expiry day."""
+    return p["premium0"] * (EXPIRY_PREMIUM_FACTOR if expiry else 1.0)
+
+
+def gate(day, i, sgn, gov, minute, p, day_date):
     """Evaluate checks C1-C8 at completed candle i. Returns (failed, snap)."""
     df = day.df
     close = float(df["close"].iloc[i])
@@ -82,6 +107,13 @@ def gate(day, i, sgn, gov, minute):
     c3 = True if trend == 0 else trend == sgn  # flip rule disabled (default)
     in_cooldown = gov["cooldown_until"] is not None and minute < gov["cooldown_until"]
 
+    # C8 for real against the synthetic (expiry-adjusted) entry premium
+    band_lo, band_hi, expiry = effective_band(p, day_date)
+    e0 = entry_premium(p, expiry)
+    c8_v11 = band_lo <= e0 <= band_hi
+    old_lo, old_hi = p["band"]
+    c8_v10 = old_lo <= e0 <= old_hi     # what the v1.0 fixed band would say
+
     checks = {
         "C1": sm5 >= gov["trigger"],
         "C2": sm30 < gov["exhaustion"],
@@ -90,19 +122,19 @@ def gate(day, i, sgn, gov, minute):
         "C5": not (KILL[0] <= minute < KILL[1]),
         "C6": gov["consecutive_sl"] < SL_CHAIN_LIMIT and not in_cooldown,
         "C7": (not gov["done"]) and gov["realised"] > DAY_BRAKE,
-        "C8": True,  # premium synthetic; band assumed (disclosed)
+        "C8": c8_v11,
     }
     failed = [k for k, v in checks.items() if not v]
     return failed, dict(close=close, m5=m5, m30=m30, sm5=sm5, sm30=sm30,
-                        rng=rng, trend=trend)
+                        rng=rng, trend=trend, expiry=expiry, e0=round(e0, 2),
+                        c8_v10=c8_v10)
 
 
-def simulate_trade(day, entry_i, sgn, p):
+def simulate_trade(day, entry_i, sgn, p, e0):
     """Walk candles after the burst close; return (exit_i, exit_reason,
     pnl_points_premium, t1_touched). Prices in premium points."""
     df = day.df
     entry_index = float(df["close"].iloc[entry_i])
-    e0 = p["premium0"]
     sl_pts = e0 * SL_PCT
     t1_pts = e0 * T1_PCT
     t2_pts = e0 * T2_PCT
@@ -131,7 +163,7 @@ def simulate_trade(day, entry_i, sgn, p):
     return len(df) - 1, "EOD", cl, t1_touched
 
 
-def run_day(name, day, p, filtered):
+def run_day(name, day, p, filtered, day_date):
     """One arm of one day. Returns list of trade dicts."""
     gov = dict(realised=0.0, consecutive_sl=0, cooldown_until=None, done=False,
                trades=0, trigger=p["trigger"], exhaustion=p["exhaustion"])
@@ -148,13 +180,15 @@ def run_day(name, day, p, filtered):
             i += 1
             continue
         sgn = 1 if m5 > 0 else -1
-        failed, snap = gate(day, i, sgn, gov, minute)
+        failed, snap = gate(day, i, sgn, gov, minute, p, day_date)
         if filtered and failed:
             trades.append(dict(taken=False, skip=",".join(failed), minute=minute,
                                side="CE" if sgn > 0 else "PE", **snap))
             i += 1
             continue
-        exit_i, reason, pnl_pts, t1t = simulate_trade(day, i, sgn, p)
+        _, _, expiry = effective_band(p, day_date)
+        e0 = entry_premium(p, expiry)
+        exit_i, reason, pnl_pts, t1t = simulate_trade(day, i, sgn, p, e0)
         pnl = pnl_pts * p["lot"]
         gov["realised"] += pnl
         gov["trades"] += 1
@@ -184,12 +218,13 @@ def main():
             if len(day.df) < 20:
                 continue
             for arm, filtered in (("RAW", False), ("FILTERED", True)):
-                for t in run_day(name, day, p, filtered):
+                for t in run_day(name, day, p, filtered, day_date):
                     t.update(index=name, date=str(day_date), arm=arm)
                     out_rows.append(t)
 
     fields = ["date", "index", "arm", "minute", "side", "taken", "skip",
-              "reason", "pnl", "t1", "m5", "m30", "sm5", "sm30", "rng", "trend"]
+              "reason", "pnl", "t1", "m5", "m30", "sm5", "sm30", "rng",
+              "trend", "expiry", "e0", "c8_v10"]
     with open("backtest_trades.csv", "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
         w.writeheader()
@@ -203,7 +238,8 @@ def main():
         return len(taken), wins, pnl
 
     dates = sorted(set(r["date"] for r in out_rows))
-    print(f"\n{'='*72}\nBACKTEST: independent scanner, {dates[0]} -> {dates[-1]}")
+    print(f"\n{'='*72}\nBACKTEST v1.1 (expiry-aware C8): independent scanner, "
+          f"{dates[0]} -> {dates[-1]}")
     days = sorted(set((r["date"], r["index"]) for r in out_rows))
     print(f"days: {len(set(d for d, _ in days))} sessions x2 indices\n")
 
@@ -242,6 +278,18 @@ def main():
         vetoed = [r for r in raw if (r["minute"], r["side"], r["date"]) in fskip]
         saved = sum(r["pnl"] for r in vetoed)
         print(f"  {name}: {len(vetoed)} raw trades vetoed, their raw P&L was Rs {saved:,.0f}")
+
+    # v1.1 fix value: FILTERED trades that the v1.0 fixed C8 band would have
+    # vetoed (expiry-day theta-crushed synthetic premium below the old band)
+    print(f"\n{'='*72}\nv1.1 EXPIRY-C8 FIX VALUE (taken now, vetoed under v1.0 band):")
+    for name in ("NIFTY", "SENSEX", "ALL"):
+        rows = [r for r in out_rows if r["arm"] == "FILTERED" and r["taken"]
+                and r.get("c8_v10") is False
+                and (name == "ALL" or r["index"] == name)]
+        pnl = sum(r["pnl"] for r in rows)
+        wins = sum(1 for r in rows if r["pnl"] > 0)
+        print(f"  {name}: {len(rows)} trades rescued, "
+              f"WR {100*wins/len(rows) if rows else 0:.0f}%, P&L Rs {pnl:,.0f}")
 
 
 if __name__ == "__main__":
